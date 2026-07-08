@@ -157,6 +157,11 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvOpts(t, true)
+}
+
+func newTestEnvOpts(t *testing.T, warmUp bool) *testEnv {
+	t.Helper()
 	oidc := newOIDCMock(t)
 
 	capture := &backendCapture{}
@@ -216,8 +221,10 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatalf("new gateway: %v", err)
 	}
-	if err := gw.WarmUp(context.Background()); err != nil {
-		t.Fatalf("warm up: %v", err)
+	if warmUp {
+		if err := gw.WarmUp(context.Background()); err != nil {
+			t.Fatalf("warm up: %v", err)
+		}
 	}
 	return &testEnv{gateway: gw, oidc: oidc, backend: backend, capture: capture}
 }
@@ -475,6 +482,24 @@ func TestHealthAndReady(t *testing.T) {
 	rr := env.do(t, http.MethodGet, "/readyz", "", "")
 	if rr.Code != http.StatusOK {
 		t.Errorf("readyz = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestReadyzSelfHeals verifies that /readyz retries the JWKS fetch when the
+// cache never warmed up (e.g. Keycloak was briefly unreachable at startup),
+// so a NotReady pod can recover without relying on real /mock/mcp traffic to
+// trigger a refresh.
+func TestReadyzSelfHeals(t *testing.T) {
+	env := newTestEnvOpts(t, false)
+	if env.gateway.Verifier().Cache().Ready() {
+		t.Fatal("expected cache to start not ready")
+	}
+	rr := env.do(t, http.MethodGet, "/readyz", "", "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("readyz = %d, want 200 after self-heal; body=%s", rr.Code, rr.Body.String())
+	}
+	if !env.gateway.Verifier().Cache().Ready() {
+		t.Fatal("cache still not ready after /readyz self-heal")
 	}
 }
 

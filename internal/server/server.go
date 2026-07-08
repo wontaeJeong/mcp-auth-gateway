@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"time"
 
 	"github.com/samsungds/mcp-auth-gateway/internal/auth"
 	"github.com/samsungds/mcp-auth-gateway/internal/config"
@@ -85,7 +86,19 @@ func (g *Gateway) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (g *Gateway) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+func (g *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	// If the JWKS cache never warmed up (e.g. Keycloak was briefly unreachable
+	// at startup), retry here so the probe self-heals once Keycloak recovers.
+	// Without this, a pod stuck NotReady never receives real /mock/mcp traffic
+	// either, so nothing would ever trigger a retry.
+	if !g.verifier.Cache().Ready() {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		if err := g.verifier.Cache().Refresh(ctx); err != nil {
+			g.logger.Warn("readyz: JWKS refresh failed", "error", err)
+		}
+		cancel()
+	}
+
 	checks := map[string]bool{
 		"config":          g.cfg != nil && len(g.cfg.Servers) > 0,
 		"jwks":            g.verifier.Cache().Ready(),
