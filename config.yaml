@@ -1,0 +1,31 @@
+server:
+  listen_addr: ":8080"
+
+auth:
+  issuer: "https://auth.mcp.aidev.samsungds.net/realms/mcp"
+  discovery_url: "https://auth.mcp.aidev.samsungds.net/realms/mcp/.well-known/openid-configuration"
+  loginid_claim: "loginid"
+  groups_claim: "groups"
+  username_claim: "preferred_username"
+  email_claim: "email"
+  jwks_cache_ttl: "10m"
+
+internal_identity:
+  issuer: "mcp-auth-gateway"
+  audience_prefix: ""
+  ttl: "60s"
+  signing_alg: "HS256"
+  secret_env: "MCP_INTERNAL_JWT_SECRET"
+
+servers:
+  - name: "mock"
+    external_path_prefix: "/mock"
+    mcp_path: "/mcp"
+    public_resource: "https://gateway.mcp.aidev.samsungds.net/mock/mcp"
+    audience: "https://gateway.mcp.aidev.samsungds.net/mock/mcp"
+    backend_url: "http://mock-mcp-server.mcp-gateway.svc.cluster.local:8080"
+    backend_identity_audience: "mock-mcp-server"
+    strip_external_path_prefix: true
+    required_scopes:
+      - "mcp:mock:use"
+    allowed_groups: []
