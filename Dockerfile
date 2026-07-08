@@ -10,4 +10,6 @@ COPY --from=build /out/gateway /gateway
 COPY config.yaml /etc/mcp-auth-gateway/config.yaml
 EXPOSE 8080
 USER nonroot:nonroot
-ENTRYPOINT ["/gateway", "-config", "/etc/mcp-auth-gateway/config.yaml"]
+ENTRYPOINT ["/gateway"]
+# Default config path; k8s deployment overrides this via `args`.
+CMD ["-config", "/etc/mcp-auth-gateway/config.yaml"]
