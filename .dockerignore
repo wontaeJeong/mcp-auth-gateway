@@ -1,0 +1,42 @@
+# Version-control metadata
+.git
+.git/**
+.gitignore
+.gitattributes
+.github
+.gitlab
+.svn
+.hg
+
+# Local environment and secret material
+.env
+.env.*
+*.pem
+*.crt
+*.cer
+*.key
+*.p12
+*.pfx
+*.secret
+*.secrets
+secrets/
+**/secrets/
+
+# Build and test artifacts
+gateway
+bin/
+build/
+dist/
+coverage/
+scripts/
+tests/
+*.out
+*.test
+*.prof
+coverage.*
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*~
