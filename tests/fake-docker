@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+
+log=${FAKE_DOCKER_LOG:?FAKE_DOCKER_LOG is required}
+
+record_command() {
+	printf '%s\n' 'COMMAND' >>"$log"
+	for argument do
+		printf 'ARG=%s\n' "$argument" >>"$log"
+	done
+}
+
+command=${1:-}
+case "$command" in
+	build)
+		if [ "${2:-}" = "--help" ]; then
+			record_command "$@"
+			printf 'HELP_ENV_DOCKER_BUILDKIT=%s\n' "${DOCKER_BUILDKIT:-}" >>"$log"
+			printf '%s\n' 'Usage: docker build [OPTIONS] PATH'
+			secret_support=${FAKE_DOCKER_SECRET_SUPPORT:-1}
+			if [ "${FAKE_DOCKER_SECRET_REQUIRES_BUILDKIT:-0}" = 1 ] && [ "${DOCKER_BUILDKIT:-}" != 1 ]; then
+				secret_support=0
+			fi
+			if [ "$secret_support" = 1 ]; then
+				printf '%s\n' '      --secret stringArray   Secret file to expose to the build'
+			fi
+			exit 0
+		fi
+		record_command "$@"
+		printf 'BUILD_ENV_DOCKER_BUILDKIT=%s\n' "${DOCKER_BUILDKIT:-}" >>"$log"
+		for name in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
+			eval "value=\${$name-}"
+			printf 'BUILD_ENV_%s=%s\n' "$name" "$value" >>"$log"
+		done
+		;;
+	push)
+		record_command "$@"
+		;;
+	image)
+		record_command "$@"
+		if [ "${2:-}" = inspect ]; then
+			printf '%s\n' "${FAKE_DOCKER_IMAGE_ID:-sha256:0123456789abcdef}"
+		fi
+		;;
+	inspect)
+		record_command "$@"
+		arguments=$*
+		case "$arguments" in
+			*Config.Env*) printf '%s\n' "${FAKE_DOCKER_IMAGE_ENV:-PATH=/usr/bin}" ;;
+			*Config.Labels*) printf '%s\n' "${FAKE_DOCKER_IMAGE_LABELS:-}" ;;
+			*Config.User*) printf '%s\n' "${FAKE_DOCKER_IMAGE_USER:-nonroot:nonroot}" ;;
+		esac
+		;;
+	create)
+		record_command "$@"
+		printf '%s\n' fake-container
+		;;
+	cp)
+		record_command "$@"
+		destination=
+		for argument do
+			destination=$argument
+		done
+		cp "${FAKE_DOCKER_CA_SOURCE:?FAKE_DOCKER_CA_SOURCE is required}" "$destination"
+		;;
+	history)
+		record_command "$@"
+		printf '%s' "${FAKE_DOCKER_HISTORY:-}"
+		;;
+	export|save)
+		record_command "$@"
+		output=
+		previous=
+		for argument do
+			if [ "$previous" = output ]; then
+				output=$argument
+				previous=
+				continue
+			fi
+			case "$argument" in
+				-o|--output) previous=output ;;
+			esac
+		done
+		[ -n "$output" ] || exit 2
+		if [ "$command" = export ]; then
+			printf '%s' "${FAKE_DOCKER_EXPORT:-}" >"$output"
+		else
+			printf '%s' "${FAKE_DOCKER_SAVE:-}" >"$output"
+		fi
+		;;
+	rm)
+		record_command "$@"
+		;;
+	*)
+		record_command "$@"
+		printf '%s\n' 'unexpected fake docker command' >&2
+		exit 2
+		;;
+esac
