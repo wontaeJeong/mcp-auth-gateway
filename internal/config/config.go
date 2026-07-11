@@ -2,7 +2,10 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -69,6 +72,10 @@ type InternalIdentityConfig struct {
 	SecretEnv      string   `yaml:"secret_env"`
 }
 
+// MaxInternalIdentityTTL limits the lifetime of credentials crossing the
+// gateway-to-backend trust boundary.
+const MaxInternalIdentityTTL = 5 * time.Minute
+
 // MCPServer describes a single backend MCP server routed by path prefix.
 type MCPServer struct {
 	Name                    string   `yaml:"name"`
@@ -80,6 +87,7 @@ type MCPServer struct {
 	BackendIdentityAudience string   `yaml:"backend_identity_audience"`
 	StripExternalPathPrefix bool     `yaml:"strip_external_path_prefix"`
 	RequiredScopes          []string `yaml:"required_scopes"`
+	AllowedOrigins          []string `yaml:"allowed_origins"`
 	AllowedGroups           []string `yaml:"allowed_groups"`
 }
 
@@ -110,8 +118,22 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	var cfg Config
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	cfg := Config{
+		Auth: AuthConfig{JWKSCacheTTL: Duration(10 * time.Minute)},
+		InternalIdentity: InternalIdentityConfig{
+			TTL: Duration(60 * time.Second),
+		},
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parse config: multiple YAML documents are not allowed")
+		}
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.applyDefaults()
@@ -137,17 +159,11 @@ func (c *Config) applyDefaults() {
 	if c.Auth.EmailClaim == "" {
 		c.Auth.EmailClaim = "email"
 	}
-	if c.Auth.JWKSCacheTTL == 0 {
-		c.Auth.JWKSCacheTTL = Duration(10 * time.Minute)
-	}
 	if c.Auth.DiscoveryURL == "" && c.Auth.Issuer != "" {
 		c.Auth.DiscoveryURL = strings.TrimRight(c.Auth.Issuer, "/") + "/.well-known/openid-configuration"
 	}
 	if c.InternalIdentity.Issuer == "" {
 		c.InternalIdentity.Issuer = "mcp-auth-gateway"
-	}
-	if c.InternalIdentity.TTL == 0 {
-		c.InternalIdentity.TTL = Duration(60 * time.Second)
 	}
 	if c.InternalIdentity.SigningAlg == "" {
 		c.InternalIdentity.SigningAlg = "HS256"
@@ -163,11 +179,26 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	if c.Auth.Issuer == "" {
+	if strings.TrimSpace(c.Auth.Issuer) == "" {
 		return fmt.Errorf("auth.issuer is required")
 	}
-	if c.Auth.DiscoveryURL == "" {
+	if _, err := parseHTTPURL("auth.issuer", c.Auth.Issuer); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Auth.DiscoveryURL) == "" {
 		return fmt.Errorf("auth.discovery_url is required")
+	}
+	if _, err := parseHTTPURL("auth.discovery_url", c.Auth.DiscoveryURL); err != nil {
+		return err
+	}
+	if c.Auth.JWKSCacheTTL.Std() <= 0 {
+		return fmt.Errorf("auth.jwks_cache_ttl must be positive")
+	}
+	if c.InternalIdentity.TTL.Std() <= 0 {
+		return fmt.Errorf("internal_identity.ttl must be positive")
+	}
+	if c.InternalIdentity.TTL.Std() > MaxInternalIdentityTTL {
+		return fmt.Errorf("internal_identity.ttl must not exceed %s", MaxInternalIdentityTTL)
 	}
 	if len(c.Servers) == 0 {
 		return fmt.Errorf("at least one server must be configured")
@@ -180,14 +211,62 @@ func (c *Config) validate() error {
 		if s.ExternalPathPrefix == "" {
 			return fmt.Errorf("servers[%q].external_path_prefix is required", s.Name)
 		}
-		if s.BackendURL == "" {
+		if strings.TrimSpace(s.BackendURL) == "" {
 			return fmt.Errorf("servers[%q].backend_url is required", s.Name)
 		}
-		if s.Audience == "" {
+		if _, err := parseHTTPURL(fmt.Sprintf("servers[%q].backend_url", s.Name), s.BackendURL); err != nil {
+			return err
+		}
+		if strings.TrimSpace(s.BackendIdentityAudience) == "" {
+			return fmt.Errorf("servers[%q].backend_identity_audience is required", s.Name)
+		}
+		if strings.TrimSpace(s.Audience) == "" {
 			return fmt.Errorf("servers[%q].audience is required", s.Name)
 		}
-		if s.PublicResource == "" {
+		if _, err := parseHTTPURL(fmt.Sprintf("servers[%q].audience", s.Name), s.Audience); err != nil {
+			return err
+		}
+		if strings.TrimSpace(s.PublicResource) == "" {
 			return fmt.Errorf("servers[%q].public_resource is required", s.Name)
+		}
+		resourceURL, err := parseHTTPURI(fmt.Sprintf("servers[%q].public_resource", s.Name), s.PublicResource)
+		if err != nil {
+			return err
+		}
+		if len(s.AllowedOrigins) == 0 {
+			return fmt.Errorf("servers[%q].allowed_origins must contain at least one origin", s.Name)
+		}
+		origins := make(map[string]bool, len(s.AllowedOrigins))
+		for _, origin := range s.AllowedOrigins {
+			if !IsSerializedHTTPOrigin(origin) {
+				return fmt.Errorf("servers[%q].allowed_origins contains invalid origin %q", s.Name, origin)
+			}
+			if origins[origin] {
+				return fmt.Errorf("servers[%q].allowed_origins contains duplicate origin %q", s.Name, origin)
+			}
+			origins[origin] = true
+		}
+		publicOrigin := resourceURL.Scheme + "://" + resourceURL.Host
+		if !origins[publicOrigin] {
+			return fmt.Errorf("servers[%q].allowed_origins must include public_resource origin %q", s.Name, publicOrigin)
+		}
+		if len(s.RequiredScopes) == 0 {
+			return fmt.Errorf("servers[%q].required_scopes must contain at least one scope", s.Name)
+		}
+		scopes := make(map[string]bool, len(s.RequiredScopes))
+		for j, scope := range s.RequiredScopes {
+			scope = strings.TrimSpace(scope)
+			if scope == "" {
+				return fmt.Errorf("servers[%q].required_scopes contains an empty scope", s.Name)
+			}
+			if !isOAuthScopeToken(scope) {
+				return fmt.Errorf("servers[%q].required_scopes entry must be one OAuth scope token: %q", s.Name, scope)
+			}
+			if scopes[scope] {
+				return fmt.Errorf("servers[%q].required_scopes contains duplicate scope %q", s.Name, scope)
+			}
+			scopes[scope] = true
+			c.Servers[i].RequiredScopes[j] = scope
 		}
 		base := s.ExternalBasePath()
 		if seen[base] {
@@ -196,6 +275,51 @@ func (c *Config) validate() error {
 		seen[base] = true
 	}
 	return nil
+}
+
+func parseHTTPURL(name, raw string) (*url.URL, error) {
+	return parseHTTPReference(name, raw, "URL")
+}
+
+func parseHTTPURI(name, raw string) (*url.URL, error) {
+	return parseHTTPReference(name, raw, "URI")
+}
+
+func parseHTTPReference(name, raw, kind string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || raw != strings.TrimSpace(raw) || !parsed.IsAbs() ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" ||
+		parsed.Hostname() == "" || parsed.Opaque != "" {
+		return nil, fmt.Errorf("%s must be an absolute http/https %s", name, kind)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery ||
+		parsed.Fragment != "" || strings.Contains(raw, "#") {
+		return nil, fmt.Errorf("%s must not contain userinfo, query, or fragment", name)
+	}
+	return parsed, nil
+}
+
+// IsSerializedHTTPOrigin reports whether origin is exactly an http/https
+// origin serialized as scheme://host, with no other URI components.
+func IsSerializedHTTPOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" {
+		return false
+	}
+	if parsed.User != nil || parsed.Opaque != "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(origin, "#") {
+		return false
+	}
+	return origin == parsed.Scheme+"://"+parsed.Host
+}
+
+func isOAuthScopeToken(scope string) bool {
+	for i := 0; i < len(scope); i++ {
+		b := scope[i]
+		if b != 0x21 && (b < 0x23 || b > 0x5b) && (b < 0x5d || b > 0x7e) {
+			return false
+		}
+	}
+	return scope != ""
 }
 
 // InternalSecret resolves the internal signing secret from the environment.

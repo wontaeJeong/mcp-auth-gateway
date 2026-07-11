@@ -28,4 +28,6 @@ servers:
     strip_external_path_prefix: true
     required_scopes:
       - "mcp:mock:use"
+    allowed_origins:
+      - "https://gateway.mcp.aidev.samsungds.net"
     allowed_groups: []
