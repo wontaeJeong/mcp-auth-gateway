@@ -15,19 +15,38 @@ import (
 // AuthError is an authentication/authorization failure carrying the HTTP status
 // that should be returned to the client.
 type AuthError struct {
-	Status  int
-	Code    string
-	Message string
+	Status     int
+	Code       string
+	Message    string
+	OAuthError string
 }
 
 func (e *AuthError) Error() string { return e.Message }
 
-func unauthorized(msg string) *AuthError {
+func missingCredentials(msg string) *AuthError {
 	return &AuthError{Status: http.StatusUnauthorized, Code: "unauthorized", Message: msg}
+}
+
+func invalidToken(msg string) *AuthError {
+	return &AuthError{
+		Status:     http.StatusUnauthorized,
+		Code:       "unauthorized",
+		Message:    msg,
+		OAuthError: "invalid_token",
+	}
 }
 
 func forbidden(msg string) *AuthError {
 	return &AuthError{Status: http.StatusForbidden, Code: "forbidden", Message: msg}
+}
+
+func insufficientScope(msg string) *AuthError {
+	return &AuthError{
+		Status:     http.StatusForbidden,
+		Code:       "forbidden",
+		Message:    msg,
+		OAuthError: "insufficient_scope",
+	}
 }
 
 // AsAuthError extracts an *AuthError from err, if present.
@@ -68,7 +87,7 @@ func (v *Verifier) Cache() *KeyCache { return v.cache }
 // scope, and group requirements. On success it returns the caller Identity.
 func (v *Verifier) Verify(ctx context.Context, rawToken string, srv config.MCPServer) (*Identity, error) {
 	if strings.TrimSpace(rawToken) == "" {
-		return nil, unauthorized("Bearer access token is required")
+		return nil, missingCredentials("Bearer access token is required")
 	}
 
 	keyFunc := func(t *jwt.Token) (interface{}, error) {
@@ -76,7 +95,7 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string, srv config.MCPSe
 			return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
 		}
 		kid, _ := t.Header["kid"].(string)
-		return v.cache.keyByID(ctx, kid)
+		return v.cache.keyByIDForAlgorithm(ctx, kid, t.Method.Alg())
 	}
 
 	claims := jwt.MapClaims{}
@@ -86,23 +105,28 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string, srv config.MCPSe
 		jwt.WithExpirationRequired(),
 	)
 	if err != nil {
-		return nil, unauthorized("invalid access token: " + sanitizeJWTError(err))
+		return nil, invalidToken("invalid access token: " + sanitizeJWTError(err))
 	}
 
 	// Audience must contain the server's resource identifier.
 	if !audienceContains(claims["aud"], srv.Audience) {
-		return nil, unauthorized("token audience does not include " + srv.Audience)
+		return nil, invalidToken("token audience does not include " + srv.Audience)
+	}
+
+	subject, ok := claims["sub"].(string)
+	if !ok || strings.TrimSpace(subject) == "" {
+		return nil, invalidToken("required claim sub must be a non-empty string")
 	}
 
 	// loginid claim is mandatory and must be non-empty.
 	loginID := stringClaim(claims, v.cfg.LoginIDClaim)
-	if loginID == "" {
-		return nil, unauthorized("required claim " + v.cfg.LoginIDClaim + " is missing")
+	if strings.TrimSpace(loginID) == "" {
+		return nil, invalidToken("required claim " + v.cfg.LoginIDClaim + " is missing")
 	}
 
 	scopes := parseScopes(claims["scope"])
 	if missing := missingScopes(scopes, srv.RequiredScopes); len(missing) > 0 {
-		return nil, forbidden("missing required scope(s): " + strings.Join(missing, " "))
+		return nil, insufficientScope("missing required scope(s): " + strings.Join(missing, " "))
 	}
 
 	groups := stringSliceClaim(claims, v.cfg.GroupsClaim)
@@ -111,7 +135,7 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string, srv config.MCPSe
 	}
 
 	return &Identity{
-		Subject:  stringClaim(claims, "sub"),
+		Subject:  subject,
 		LoginID:  loginID,
 		Username: stringClaim(claims, v.cfg.UsernameClaim),
 		Email:    stringClaim(claims, v.cfg.EmailClaim),

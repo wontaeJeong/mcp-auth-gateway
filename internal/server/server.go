@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -73,6 +74,7 @@ func (g *Gateway) routes() error {
 
 		// Protected Resource Metadata (RFC 9728), path-scoped per resource.
 		g.mux.HandleFunc("GET "+srv.MetadataPath(), g.metadataHandler(srv))
+		g.mux.HandleFunc("OPTIONS "+srv.MetadataPath(), g.metadataPreflightHandler(srv))
 
 		// MCP endpoints: exact base path and subtree.
 		base := srv.ExternalBasePath()
@@ -122,27 +124,103 @@ func (g *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) metadataHandler(srv config.MCPServer) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !setMetadataCORS(w.Header(), r.Header, srv.AllowedOrigins) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"resource":              srv.PublicResource,
-			"authorization_servers": []string{g.cfg.Auth.Issuer},
-			"scopes_supported":      srv.RequiredScopes,
+			"resource":                 srv.PublicResource,
+			"resource_name":            srv.Name,
+			"authorization_servers":    []string{g.cfg.Auth.Issuer},
+			"scopes_supported":         srv.RequiredScopes,
+			"bearer_methods_supported": []string{"header"},
 		})
 	}
+}
+
+func (g *Gateway) metadataPreflightHandler(srv config.MCPServer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !setMetadataCORS(w.Header(), r.Header, srv.AllowedOrigins) ||
+			r.Header.Get("Access-Control-Request-Method") != http.MethodGet {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Methods", http.MethodGet)
+		w.Header().Set("Access-Control-Allow-Headers", "MCP-Protocol-Version")
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func setMetadataCORS(response, request http.Header, allowed []string) bool {
+	origins, present := request[http.CanonicalHeaderKey("Origin")]
+	if !present {
+		return true
+	}
+	if len(origins) != 1 || !config.IsSerializedHTTPOrigin(origins[0]) {
+		return false
+	}
+	for _, candidate := range allowed {
+		if origins[0] == candidate {
+			response.Set("Access-Control-Allow-Origin", origins[0])
+			response.Add("Vary", "Origin")
+			return true
+		}
+	}
+	return false
 }
 
 // protect verifies the caller, strips spoofable headers, mints an internal
 // identity token and proxies to the backend.
 func (g *Gateway) protect(rs *routedServer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r.Header.Get("Authorization"))
+		if !isAllowedOrigin(r.Header, rs.cfg.AllowedOrigins) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "forbidden",
+				"message": "request Origin is not allowed",
+			})
+			return
+		}
+
+		authorizations := r.Header.Values("Authorization")
+		if len(authorizations) > 1 {
+			g.writeAuthError(w, rs.cfg, &auth.AuthError{
+				Status:     http.StatusUnauthorized,
+				Code:       "unauthorized",
+				Message:    "multiple Authorization headers are not allowed",
+				OAuthError: "invalid_token",
+			})
+			return
+		}
+		authorization := ""
+		if len(authorizations) == 1 {
+			authorization = authorizations[0]
+		}
+		token := bearerToken(authorization)
+		if token == "" && strings.TrimSpace(authorization) != "" {
+			g.writeAuthError(w, rs.cfg, &auth.AuthError{
+				Status:     http.StatusUnauthorized,
+				Code:       "unauthorized",
+				Message:    "Bearer access token is invalid",
+				OAuthError: "invalid_token",
+			})
+			return
+		}
 		id, err := g.verifier.Verify(r.Context(), token, rs.cfg)
 		if err != nil {
 			g.writeAuthError(w, rs.cfg, err)
 			return
 		}
 
-		requestID := newRequestID()
+		requestID, err := newRequestID(rand.Reader)
+		if err != nil {
+			g.logger.Error("failed to generate request ID", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error":   "internal_error",
+				"message": "failed to establish backend identity",
+			})
+			return
+		}
 		internalToken, err := g.signer.Sign(id, rs.cfg.BackendIdentityAudience, requestID)
 		if err != nil {
 			g.logger.Error("failed to mint internal identity token", "error", err)
@@ -173,10 +251,15 @@ func (g *Gateway) protect(rs *routedServer) http.Handler {
 func (g *Gateway) writeAuthError(w http.ResponseWriter, srv config.MCPServer, err error) {
 	ae, ok := auth.AsAuthError(err)
 	if !ok {
-		ae = &auth.AuthError{Status: http.StatusUnauthorized, Code: "unauthorized", Message: err.Error()}
+		ae = &auth.AuthError{
+			Status:     http.StatusUnauthorized,
+			Code:       "unauthorized",
+			Message:    "invalid access token",
+			OAuthError: "invalid_token",
+		}
 	}
-	if ae.Status == http.StatusUnauthorized {
-		w.Header().Set("WWW-Authenticate", g.wwwAuthenticate(srv))
+	if ae.Status == http.StatusUnauthorized || ae.OAuthError == "insufficient_scope" {
+		w.Header().Set("WWW-Authenticate", g.wwwAuthenticate(srv, ae.OAuthError))
 	}
 	writeJSON(w, ae.Status, map[string]string{
 		"error":   ae.Code,
@@ -184,10 +267,14 @@ func (g *Gateway) writeAuthError(w http.ResponseWriter, srv config.MCPServer, er
 	})
 }
 
-func (g *Gateway) wwwAuthenticate(srv config.MCPServer) string {
+func (g *Gateway) wwwAuthenticate(srv config.MCPServer, oauthError string) string {
 	metadataURL := strings.TrimRight(publicOrigin(srv.PublicResource), "/") + srv.MetadataPath()
 	scope := strings.Join(srv.RequiredScopes, " ")
-	return fmt.Sprintf(`Bearer realm="mcp", resource_metadata=%q, scope=%q`, metadataURL, scope)
+	challenge := fmt.Sprintf(`Bearer realm="mcp", resource_metadata=%q, scope=%q`, metadataURL, scope)
+	if oauthError != "" {
+		challenge += fmt.Sprintf(`, error=%q`, oauthError)
+	}
+	return challenge
 }
 
 // publicOrigin returns the scheme://host of a public resource URL.
@@ -202,6 +289,22 @@ func publicOrigin(resource string) string {
 	return resource
 }
 
+func isAllowedOrigin(header http.Header, allowed []string) bool {
+	origins, present := header[http.CanonicalHeaderKey("Origin")]
+	if !present {
+		return true
+	}
+	if len(origins) != 1 || !config.IsSerializedHTTPOrigin(origins[0]) {
+		return false
+	}
+	for _, candidate := range allowed {
+		if origins[0] == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 func bearerToken(header string) string {
 	const prefix = "Bearer "
 	if len(header) >= len(prefix) && strings.EqualFold(header[:len(prefix)], prefix) {
@@ -210,12 +313,12 @@ func bearerToken(header string) string {
 	return ""
 }
 
-func newRequestID() string {
+func newRequestID(random io.Reader) (string, error) {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "req-unknown"
+	if _, err := io.ReadFull(random, b[:]); err != nil {
+		return "", fmt.Errorf("read request ID entropy: %w", err)
 	}
-	return hex.EncodeToString(b[:])
+	return hex.EncodeToString(b[:]), nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body interface{}) {

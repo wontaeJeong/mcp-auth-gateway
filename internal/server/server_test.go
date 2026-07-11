@@ -24,6 +24,7 @@ import (
 
 const (
 	testResource = "https://gateway.mcp.aidev.samsungds.net/mock/mcp"
+	testOrigin   = "https://gateway.mcp.aidev.samsungds.net"
 	testScope    = "mcp:mock:use"
 	testKID      = "test-key-1"
 	testSecret   = "super-secret-internal-signing-key"
@@ -77,7 +78,8 @@ type tokenOpts struct {
 	aud     interface{}
 	scope   string
 	loginid string
-	sub     string
+	sub     interface{}
+	omitSub bool
 	groups  []string
 	exp     time.Time
 	kid     string
@@ -101,16 +103,19 @@ func (m *oidcMock) mintToken(t *testing.T, o tokenOpts) string {
 	if o.signKey == nil {
 		o.signKey = m.key
 	}
-	if o.sub == "" {
-		o.sub = "user-sub-123"
-	}
 	claims := jwt.MapClaims{
 		"iss": o.issuer,
 		"aud": o.aud,
-		"sub": o.sub,
 		"exp": o.exp.Unix(),
 		"iat": time.Now().Unix(),
 		"nbf": time.Now().Add(-time.Minute).Unix(),
+	}
+	if !o.omitSub {
+		sub := o.sub
+		if sub == nil {
+			sub = "user-sub-123"
+		}
+		claims["sub"] = sub
 	}
 	if o.scope != "" {
 		claims["scope"] = o.scope
@@ -206,6 +211,7 @@ func newTestEnvOpts(t *testing.T, warmUp bool) *testEnv {
 				BackendIdentityAudience: backendAud,
 				StripExternalPathPrefix: true,
 				RequiredScopes:          []string{testScope},
+				AllowedOrigins:          []string{testOrigin},
 				AllowedGroups:           []string{},
 			},
 		},
@@ -248,8 +254,10 @@ func TestProtectedResourceMetadata(t *testing.T) {
 	}
 	var doc struct {
 		Resource             string   `json:"resource"`
+		ResourceName         string   `json:"resource_name"`
 		AuthorizationServers []string `json:"authorization_servers"`
 		ScopesSupported      []string `json:"scopes_supported"`
+		BearerMethods        []string `json:"bearer_methods_supported"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -257,11 +265,50 @@ func TestProtectedResourceMetadata(t *testing.T) {
 	if doc.Resource != testResource {
 		t.Errorf("resource = %q, want %q", doc.Resource, testResource)
 	}
+	if doc.ResourceName != "mock" {
+		t.Errorf("resource_name = %q, want mock", doc.ResourceName)
+	}
 	if len(doc.ScopesSupported) != 1 || doc.ScopesSupported[0] != testScope {
 		t.Errorf("scopes_supported = %v, want [%q]", doc.ScopesSupported, testScope)
 	}
 	if len(doc.AuthorizationServers) != 1 || doc.AuthorizationServers[0] != env.oidc.issuer {
 		t.Errorf("authorization_servers = %v", doc.AuthorizationServers)
+	}
+	if len(doc.BearerMethods) != 1 || doc.BearerMethods[0] != "header" {
+		t.Errorf("bearer_methods_supported = %v, want [header]", doc.BearerMethods)
+	}
+}
+
+func TestProtectedResourceMetadataSupportsInspectorCORS(t *testing.T) {
+	env := newTestEnv(t)
+	path := "/.well-known/oauth-protected-resource/mock/mcp"
+
+	preflight := httptest.NewRequest(http.MethodOptions, path, nil)
+	preflight.Header.Set("Origin", testOrigin)
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	preflight.Header.Set("Access-Control-Request-Headers", "mcp-protocol-version")
+	preflightResponse := httptest.NewRecorder()
+	env.gateway.ServeHTTP(preflightResponse, preflight)
+	if preflightResponse.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", preflightResponse.Code)
+	}
+	if got := preflightResponse.Header().Get("Access-Control-Allow-Origin"); got != testOrigin {
+		t.Fatalf("preflight Access-Control-Allow-Origin = %q, want %q", got, testOrigin)
+	}
+	if got := preflightResponse.Header().Get("Access-Control-Allow-Headers"); !strings.EqualFold(got, "MCP-Protocol-Version") {
+		t.Fatalf("preflight Access-Control-Allow-Headers = %q", got)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	request.Header.Set("Origin", testOrigin)
+	request.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	response := httptest.NewRecorder()
+	env.gateway.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, want 200", response.Code)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != testOrigin {
+		t.Fatalf("metadata Access-Control-Allow-Origin = %q, want %q", got, testOrigin)
 	}
 }
 
@@ -281,6 +328,9 @@ func TestMissingToken401(t *testing.T) {
 	if !strings.Contains(wa, `scope="mcp:mock:use"`) {
 		t.Errorf("WWW-Authenticate scope wrong: %q", wa)
 	}
+	if strings.Contains(wa, `error=`) {
+		t.Errorf("WWW-Authenticate for missing credentials contains OAuth error: %q", wa)
+	}
 	var body struct {
 		Error   string `json:"error"`
 		Message string `json:"message"`
@@ -288,6 +338,62 @@ func TestMissingToken401(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &body)
 	if body.Error != "unauthorized" {
 		t.Errorf("error = %q, want unauthorized", body.Error)
+	}
+}
+
+func TestMalformedAuthorizationInvalidTokenChallenge(t *testing.T) {
+	env := newTestEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/mock/mcp", nil)
+	req.Header.Set("Authorization", "Basic opaque-secret-value")
+	rr := httptest.NewRecorder()
+
+	env.gateway.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	wa := rr.Header().Get("WWW-Authenticate")
+	if !strings.Contains(wa, `error="invalid_token"`) {
+		t.Errorf("WWW-Authenticate = %q, want invalid_token", wa)
+	}
+	if strings.Contains(wa, "opaque-secret-value") || strings.Contains(rr.Body.String(), "opaque-secret-value") {
+		t.Error("response leaked raw credential text")
+	}
+}
+
+func TestDuplicateAuthorizationHeadersAreRejected(t *testing.T) {
+	env := newTestEnv(t)
+	tok := env.oidc.mintToken(t, tokenOpts{scope: testScope, loginid: "alice01"})
+	req := httptest.NewRequest(http.MethodPost, "/mock/mcp", nil)
+	req.Header["Authorization"] = []string{"Bearer " + tok, "Bearer " + tok}
+	rr := httptest.NewRecorder()
+
+	env.gateway.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if wa := rr.Header().Get("WWW-Authenticate"); !strings.Contains(wa, `error="invalid_token"`) {
+		t.Errorf("WWW-Authenticate = %q, want invalid_token", wa)
+	}
+	if path, _, _ := env.capture.snapshot(); path != "" {
+		t.Errorf("backend received duplicate-Authorization request at %q", path)
+	}
+}
+
+func TestQueryTokenIsNotAccepted(t *testing.T) {
+	env := newTestEnv(t)
+	tok := env.oidc.mintToken(t, tokenOpts{scope: testScope, loginid: "alice01"})
+	rr := env.do(t, http.MethodPost, "/mock/mcp?access_token="+tok, "", "")
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if wa := rr.Header().Get("WWW-Authenticate"); strings.Contains(wa, `error=`) {
+		t.Errorf("WWW-Authenticate = %q, want missing-credentials challenge", wa)
+	}
+	if path, _, _ := env.capture.snapshot(); path != "" {
+		t.Errorf("backend received query-token request at %q", path)
 	}
 }
 
@@ -299,6 +405,9 @@ func TestIssuerMismatch401(t *testing.T) {
 	rr := env.do(t, http.MethodPost, "/mock/mcp", tok, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if wa := rr.Header().Get("WWW-Authenticate"); !strings.Contains(wa, `error="invalid_token"`) {
+		t.Errorf("WWW-Authenticate = %q, want invalid_token", wa)
 	}
 }
 
@@ -320,6 +429,13 @@ func TestInsufficientScope403(t *testing.T) {
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rr.Code)
 	}
+	wa := rr.Header().Get("WWW-Authenticate")
+	if !strings.Contains(wa, `error="insufficient_scope"`) {
+		t.Errorf("WWW-Authenticate = %q, want insufficient_scope", wa)
+	}
+	if !strings.Contains(wa, `scope="mcp:mock:use"`) {
+		t.Errorf("WWW-Authenticate scope wrong: %q", wa)
+	}
 	var body struct {
 		Error string `json:"error"`
 	}
@@ -335,6 +451,54 @@ func TestMissingLoginID401(t *testing.T) {
 	rr := env.do(t, http.MethodPost, "/mock/mcp", tok, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+}
+
+func TestWhitespaceLoginID401(t *testing.T) {
+	env := newTestEnv(t)
+	tok := env.oidc.mintToken(t, tokenOpts{scope: testScope, loginid: " \t "})
+	rr := env.do(t, http.MethodPost, "/mock/mcp", tok, "")
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if wa := rr.Header().Get("WWW-Authenticate"); !strings.Contains(wa, `error="invalid_token"`) {
+		t.Errorf("WWW-Authenticate = %q, want invalid_token", wa)
+	}
+	if path, _, _ := env.capture.snapshot(); path != "" {
+		t.Errorf("backend received rejected request at %q", path)
+	}
+}
+
+func TestInvalidSubject401(t *testing.T) {
+	tests := []struct {
+		name    string
+		sub     interface{}
+		omitSub bool
+	}{
+		{name: "missing", omitSub: true},
+		{name: "empty", sub: ""},
+		{name: "whitespace", sub: " \t "},
+		{name: "non-string", sub: 12345},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			tok := env.oidc.mintToken(t, tokenOpts{
+				scope: testScope, loginid: "alice01", sub: tt.sub, omitSub: tt.omitSub,
+			})
+			rr := env.do(t, http.MethodPost, "/mock/mcp", tok, "")
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rr.Code)
+			}
+			if wa := rr.Header().Get("WWW-Authenticate"); !strings.Contains(wa, `error="invalid_token"`) {
+				t.Errorf("WWW-Authenticate = %q, want invalid_token", wa)
+			}
+			if path, _, _ := env.capture.snapshot(); path != "" {
+				t.Errorf("backend received rejected request at %q", path)
+			}
+		})
 	}
 }
 
@@ -416,6 +580,62 @@ func TestValidTokenProxies(t *testing.T) {
 	}
 	if claims["request_id"] != headers.Get("X-MCP-Request-ID") {
 		t.Errorf("internal request_id mismatch: %v vs %v", claims["request_id"], headers.Get("X-MCP-Request-ID"))
+	}
+	if claims["nbf"] == nil {
+		t.Error("internal token is missing nbf")
+	}
+}
+
+func TestAllowedOriginProxies(t *testing.T) {
+	env := newTestEnv(t)
+	tok := env.oidc.mintToken(t, tokenOpts{scope: testScope, loginid: "alice01"})
+	req := httptest.NewRequest(http.MethodPost, "/mock/mcp", nil)
+	req.Header.Set("Origin", testOrigin)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rr := httptest.NewRecorder()
+
+	env.gateway.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if path, _, _ := env.capture.snapshot(); path != "/mcp" {
+		t.Errorf("backend path = %q, want /mcp", path)
+	}
+}
+
+func TestRejectedOriginsBeforeAuthenticationAndProxy(t *testing.T) {
+	tests := []struct {
+		name    string
+		origins []string
+	}{
+		{name: "empty", origins: []string{""}},
+		{name: "null", origins: []string{"null"}},
+		{name: "malformed", origins: []string{"not-an-origin"}},
+		{name: "path is not an origin", origins: []string{testOrigin + "/path"}},
+		{name: "unlisted", origins: []string{"https://gateway.mcp.aidev.samsungds.net.evil.example"}},
+		{name: "multiple", origins: []string{testOrigin, "https://evil.example"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			req := httptest.NewRequest(http.MethodPost, "/mock/mcp", nil)
+			req.Header["Origin"] = tt.origins
+			rr := httptest.NewRecorder()
+
+			env.gateway.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body=%s", rr.Code, rr.Body.String())
+			}
+			if wa := rr.Header().Get("WWW-Authenticate"); wa != "" {
+				t.Errorf("WWW-Authenticate = %q, want no auth challenge", wa)
+			}
+			if path, _, _ := env.capture.snapshot(); path != "" {
+				t.Errorf("backend received rejected request at %q", path)
+			}
+		})
 	}
 }
 
